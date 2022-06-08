@@ -581,10 +581,17 @@ impl Renderer {
             // We don't.
             fbs => {
                 // Create a swapchain of color buffers, and a shared depth buffer.
+                let min_image_count = self
+                    .device
+                    .physical_device()
+                    .surface_capabilities(&*self.surface, Default::default())?
+                    .min_image_count;
+                let min_image_count = std::cmp::max(min_image_count, 2);
                 let info = SwapchainCreateInfo {
                     image_usage: ImageUsage::color_attachment(),
                     image_extent: dimensions.into(),
                     image_format: Some(self.color_format),
+                    min_image_count,
                     ..Default::default()
                 };
 
