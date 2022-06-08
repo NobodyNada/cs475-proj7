@@ -18,9 +18,10 @@ pub struct Velocity {
 
 pub mod compute {
     pub const PRESSURE_CELL_SIZE: f32 = 0.1;
-    pub const PRESSURE_RADIUS: f32 = 5.0;
+    pub const PRESSURE_RADIUS: f32 = 20.0;
     pub const NUM_CELLS_PERAXIS: u32 = (2.0 * PRESSURE_RADIUS / PRESSURE_CELL_SIZE) as u32;
     pub const NUM_CELLS_TOTAL: u32 = NUM_CELLS_PERAXIS.pow(3);
+    pub const EQ_BANDS: u32 = 64;
     impl SpecializationConstants {
         pub fn new() -> Self {
             Self {
@@ -28,6 +29,7 @@ pub mod compute {
                 PRESSURE_CELL_SIZE,
                 NUM_CELLS_PERAXIS,
                 NUM_CELLS_TOTAL,
+                EQ_BANDS,
             }
         }
     }
@@ -46,10 +48,10 @@ pub mod compute {
         layout(constant_id = 1) const float PRESSURE_RADIUS = 1;
         layout(constant_id = 2) const uint NUM_CELLS_PERAXIS = 1;
         layout(constant_id = 3) const uint NUM_CELLS_TOTAL = 1;
+        layout(constant_id = 4) const uint EQ_BANDS = 1;
 
-        const float G = 0.1 / 60.0;
-        const float DRAG = 1 - (0.1 / 60.0);
-        const float PRESSURE_STRENGTH = 1e-5 / 60.0;
+        const float G = 0.5;
+        const float PRESSURE_STRENGTH = 1e-4;
 
         layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
@@ -64,8 +66,12 @@ pub mod compute {
         } pressure;
         layout(set = 1, binding = 0) uniform Uniforms {
             bool which_pressure_buffer;
+            float amplitude;
+            float elapsed;
         } uniforms;
-
+        layout(set = 1, binding = 1) buffer Bands {
+            vec4 bands[];
+        } bands;
 
         // Hashing algorithm from Stack Overflow user Spatial:
         // https://stackoverflow.com/a/17479300/3476191
@@ -106,6 +112,20 @@ pub mod compute {
             vec3 p = position.position[i].xyz / position.position[i].w;
             vec3 v = velocity.velocity[i];
 
+            uint band_idx = i * EQ_BANDS / gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+
+            uint prev, next;
+            if (band_idx != 0) prev = band_idx - 1;
+            else prev = band_idx;
+            if (band_idx != EQ_BANDS - 1) next = band_idx + 1;
+            else next = band_idx;
+
+            float frac = float(i % EQ_BANDS) / EQ_BANDS;
+
+            float intensity;
+            if (frac < 0.5) intensity = mix(bands.bands[prev].x, bands.bands[band_idx].x, frac*2);
+            else intensity = mix(bands.bands[next].x, bands.bands[band_idx].x, (frac + 0.5) * 2);
+
             int cell_x = int((p.x + PRESSURE_RADIUS) / PRESSURE_CELL_SIZE);
             int cell_y = int((p.y + PRESSURE_RADIUS) / PRESSURE_CELL_SIZE);
             int cell_z = int((p.z + PRESSURE_RADIUS) / PRESSURE_CELL_SIZE);
@@ -117,15 +137,16 @@ pub mod compute {
             else cell = int((cell_z*NUM_CELLS_PERAXIS + cell_y)*NUM_CELLS_PERAXIS + cell_x);
 
             v -= normalize(p) * G;
-            v *= DRAG;
+            float drag = 1 - intensity;
+            v *= 1 - drag * uniforms.elapsed;
             if (cell != -1) {
                 uint h = hash(floatBitsToUint(v)) ^ hash(floatBitsToUint(p));
                 vec3 r = vec3(floatConstruct(hash(h)), floatConstruct(hash(h + 1)), floatConstruct(hash(h + 2)));
                 r -= vec3(0.5, 0.5, 0.5);
                 float p = pressure.pressure[cell + (uniforms.which_pressure_buffer ? NUM_CELLS_PERAXIS : 0)];
-                v += r * PRESSURE_STRENGTH * pressure.pressure[cell];
+                v += r * PRESSURE_STRENGTH * pressure.pressure[cell] * uniforms.amplitude * uniforms.elapsed;
             }
-            p.xyz += v;
+            p.xyz += v * uniforms.elapsed;
 
             position.position[i] = vec4(p, 1);
             velocity.velocity[i] = v;
@@ -141,6 +162,13 @@ pub mod compute {
 }
 
 pub mod vertex {
+    impl SpecializationConstants {
+        pub fn new() -> Self {
+            Self {
+                EQ_BANDS: super::compute::EQ_BANDS,
+            }
+        }
+    }
     vulkano_shaders::shader! {
         ty: "vertex",
         types_meta: {
@@ -152,12 +180,46 @@ pub mod vertex {
         #version 450
         layout(location = 0) in vec4 position;
 
+        layout(constant_id = 0) const uint EQ_BANDS = 1;
+
         layout(set = 0, binding = 0) uniform Uniforms {
             mat4 matrix;
+            uint num_points;
         } uniforms;
+        layout(set = 0, binding = 1) buffer Bands {
+            vec4 bands[];
+        } bands;
+
+        layout(location = 0) out vec4 color;
+
+        // https://stackoverflow.com/a/17897228/3476191
+        // All components are in the range [0…1], including hue.
+        vec3 hsv2rgb(vec3 c)
+        {
+            vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+            vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+            return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+        }
         
         void main() {
             gl_Position = uniforms.matrix * position;
+
+            uint band_idx = gl_VertexIndex * EQ_BANDS / uniforms.num_points;
+
+            uint prev, next;
+            if (band_idx != 0) prev = band_idx - 1;
+            else prev = band_idx;
+            if (band_idx != EQ_BANDS - 1) next = band_idx + 1;
+            else next = band_idx;
+
+            float frac = float(gl_VertexIndex % EQ_BANDS) / EQ_BANDS;
+
+            float intensity;
+            if (frac < 0.5) intensity = mix(bands.bands[prev].x, bands.bands[band_idx].x, frac*2);
+            else intensity = mix(bands.bands[next].x, bands.bands[band_idx].x, (frac + 0.5) * 2);
+
+            float hue = float(gl_VertexIndex) / uniforms.num_points;
+            color = vec4(hsv2rgb(vec3(hue, 1, 1)), 1) * intensity;
         }
         "
     }
@@ -168,10 +230,11 @@ pub mod fragment {
         ty: "fragment",
         src: "
         #version 450
-        layout(location = 0) out vec4 color;
+        layout(location = 0) in vec4 in_color;
+        layout(location = 0) out vec4 out_color;
         
         void main() {
-            color = vec4(1, 0, 0, 1);
+            out_color = in_color;
         }
         "
     }

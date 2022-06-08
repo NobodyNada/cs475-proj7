@@ -1,12 +1,17 @@
+use std::collections::VecDeque;
+use std::time::Duration;
 use std::{sync::Arc, time::Instant};
 
 use anyhow::{anyhow, bail, Result};
 use cgmath::{Matrix4, Point3, Vector3};
+use rustfft::num_complex::Complex;
 use vulkano::buffer::{BufferAccess, CpuAccessibleBuffer, DeviceLocalBuffer};
 use vulkano::command_buffer::PrimaryCommandBuffer;
 use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::pipeline::layout::PipelineLayoutCreateInfo;
 use vulkano::pipeline::{ComputePipeline, Pipeline, PipelineLayout};
+use vulkano::query::{QueryPool, QueryPoolCreateInfo, QueryResultFlags, QueryType};
+use vulkano::sync::PipelineStage;
 use vulkano::{
     buffer::{BufferUsage, CpuBufferPool, TypedBufferAccess},
     command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, SubpassContents},
@@ -48,10 +53,11 @@ use winit::{
     window::Window,
 };
 
+mod audio;
 mod shader;
 
 const NUM_PARTICLES_PERAXIS: usize = 100;
-const VIEW_DISTANCE: f32 = 20.0;
+const VIEW_DISTANCE: f32 = 10.0;
 
 struct Renderer {
     device: Arc<Device>,
@@ -61,7 +67,6 @@ struct Renderer {
     depth_format: Format,
     render_pass: Arc<RenderPass>,
     framebuffers: Framebuffers,
-    inflight: Option<Box<dyn GpuFuture>>,
     compute_pipeline: Arc<ComputePipeline>,
     graphics_pipeline: Arc<GraphicsPipeline>,
     points: Arc<DeviceLocalBuffer<[shader::Point]>>,
@@ -73,12 +78,21 @@ struct Renderer {
     compute_uniform_descriptor_pool: SingleLayoutDescSetPool,
 
     vertex_uniforms: CpuBufferPool<shader::vertex::ty::Uniforms>,
+    bands_uniform: CpuBufferPool<[shader::Point; 64]>,
     vertex_uniform_descriptor_pool: SingleLayoutDescSetPool,
 
     matrix: cgmath::Matrix4<f32>,
+    last_frame: Instant,
     last_fps_print: Instant,
     frames: u32,
     which_pressure_buffer: bool,
+
+    player: Option<audio::Player>,
+    sample_buffer: VecDeque<f32>,
+
+    query_pool: Arc<QueryPool>,
+    particles: f32,
+    seconds: f32,
 }
 
 enum Framebuffers {
@@ -162,7 +176,12 @@ impl Renderer {
         Ok((device, queues.next().unwrap()))
     }
 
-    fn new(device: Arc<Device>, queue: Arc<Queue>, surface: Arc<Surface<Window>>) -> Result<Self> {
+    fn new(
+        device: Arc<Device>,
+        queue: Arc<Queue>,
+        surface: Arc<Surface<Window>>,
+        player: Option<audio::Player>,
+    ) -> Result<Self> {
         let color_format = device
             .physical_device()
             .surface_formats(&surface, Default::default())?
@@ -241,7 +260,10 @@ impl Renderer {
                 )?,
                 points_buffer.clone(),
             )?;
-        let inflight = cmd_builder.build()?.execute(queue.clone())?;
+        let inflight = cmd_builder
+            .build()?
+            .execute(queue.clone())?
+            .then_signal_fence_and_flush()?;
 
         let render_pass = single_pass_renderpass!(device.clone(),
             attachments: {
@@ -316,16 +338,32 @@ impl Renderer {
         let compute_uniform_layout = DescriptorSetLayout::new(
             device.clone(),
             DescriptorSetLayoutCreateInfo {
-                bindings: std::collections::BTreeMap::from([(
-                    0,
-                    DescriptorSetLayoutBinding {
-                        stages: ShaderStages {
-                            compute: true,
-                            ..Default::default()
+                bindings: std::collections::BTreeMap::from([
+                    (
+                        0,
+                        DescriptorSetLayoutBinding {
+                            stages: ShaderStages {
+                                compute: true,
+                                ..Default::default()
+                            },
+                            ..DescriptorSetLayoutBinding::descriptor_type(
+                                DescriptorType::UniformBuffer,
+                            )
                         },
-                        ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
-                    },
-                )]),
+                    ),
+                    (
+                        1,
+                        DescriptorSetLayoutBinding {
+                            stages: ShaderStages {
+                                compute: true,
+                                ..Default::default()
+                            },
+                            ..DescriptorSetLayoutBinding::descriptor_type(
+                                DescriptorType::StorageBuffer,
+                            )
+                        },
+                    ),
+                ]),
                 ..Default::default()
             },
         )?;
@@ -366,7 +404,10 @@ impl Renderer {
             .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
             .vertex_input_state(BuffersDefinition::new().vertex::<shader::Point>())
             .input_assembly_state(InputAssemblyState::new().topology(PrimitiveTopology::PointList))
-            .vertex_shader(vs.entry_point("main").unwrap(), ())
+            .vertex_shader(
+                vs.entry_point("main").unwrap(),
+                shader::vertex::SpecializationConstants::new(),
+            )
             .viewport_state(ViewportState::viewport_dynamic_scissor_irrelevant())
             .fragment_shader(fs.entry_point("main").unwrap(), ())
             .build(device.clone())?;
@@ -375,27 +416,60 @@ impl Renderer {
             device.clone(),
             BufferUsage::uniform_buffer_transfer_destination(),
         );
+        let bands_uniform = CpuBufferPool::new(
+            device.clone(),
+            BufferUsage {
+                storage_buffer: true,
+                transfer_destination: true,
+                ..Default::default()
+            },
+        );
+
         let matrix = Self::create_matrix(surface.window().inner_size());
 
-        let graphics_uniform_descriptor_pool =
+        let vertex_uniform_descriptor_pool =
             SingleLayoutDescSetPool::new(DescriptorSetLayout::new(
                 device.clone(),
                 DescriptorSetLayoutCreateInfo {
-                    bindings: std::collections::BTreeMap::from([(
-                        0,
-                        DescriptorSetLayoutBinding {
-                            stages: ShaderStages {
-                                vertex: true,
-                                ..Default::default()
+                    bindings: std::collections::BTreeMap::from([
+                        (
+                            0,
+                            DescriptorSetLayoutBinding {
+                                stages: ShaderStages {
+                                    vertex: true,
+                                    ..Default::default()
+                                },
+                                ..DescriptorSetLayoutBinding::descriptor_type(
+                                    DescriptorType::UniformBuffer,
+                                )
                             },
-                            ..DescriptorSetLayoutBinding::descriptor_type(
-                                DescriptorType::UniformBuffer,
-                            )
-                        },
-                    )]),
+                        ),
+                        (
+                            1,
+                            DescriptorSetLayoutBinding {
+                                stages: ShaderStages {
+                                    vertex: true,
+                                    ..Default::default()
+                                },
+                                ..DescriptorSetLayoutBinding::descriptor_type(
+                                    DescriptorType::StorageBuffer,
+                                )
+                            },
+                        ),
+                    ]),
                     ..Default::default()
                 },
             )?);
+
+        let query_pool = QueryPool::new(
+            device.clone(),
+            QueryPoolCreateInfo {
+                query_count: 2,
+                ..QueryPoolCreateInfo::query_type(QueryType::Timestamp)
+            },
+        )?;
+
+        inflight.wait(None)?;
 
         Ok(Self {
             device,
@@ -405,7 +479,6 @@ impl Renderer {
             depth_format,
             render_pass,
             framebuffers: Framebuffers::NotCreated,
-            inflight: Some(inflight.boxed()),
             compute_pipeline,
             graphics_pipeline,
             points: points_buffer,
@@ -415,11 +488,18 @@ impl Renderer {
             compute_uniforms,
             compute_uniform_descriptor_pool,
             vertex_uniforms,
-            vertex_uniform_descriptor_pool: graphics_uniform_descriptor_pool,
+            bands_uniform,
+            vertex_uniform_descriptor_pool,
             matrix,
+            last_frame: Instant::now(),
             last_fps_print: Instant::now(),
             frames: 0,
             which_pressure_buffer: false,
+            player,
+            sample_buffer: VecDeque::new(),
+            query_pool,
+            particles: 0.0,
+            seconds: 0.0,
         })
     }
 
@@ -441,6 +521,9 @@ impl Renderer {
     fn render(&mut self) -> Result<()> {
         let dimensions = self.surface.window().inner_size();
 
+        let elapsed: Duration = self.last_frame.elapsed();
+        self.last_frame = Instant::now();
+
         // First, ensure we have framebuffers set up.
         let (swapchain, framebuffers) = match std::mem::take(&mut self.framebuffers) {
             // We do, good!
@@ -461,10 +544,8 @@ impl Renderer {
 
                 let (swapchain, images) = if let Framebuffers::Invalid { swapchain } = fbs {
                     // We have an existing swapchain, recreate it.
-                    println!("recreate");
                     swapchain.recreate(info)
                 } else {
-                    println!("new");
                     Swapchain::new(self.device.clone(), self.surface.clone(), info)
                 }?;
 
@@ -509,15 +590,62 @@ impl Renderer {
             Err(e) => bail!(e),
         };
 
+        // Figure out our uniforms.
+        const EQ_BANDS: usize = shader::compute::EQ_BANDS as usize;
+        let mut bands = [shader::Point {
+            position: [1.0, 0.0, 0.0, 0.0],
+        }; EQ_BANDS];
+        let amplitude = if let Some(ref p) = self.player {
+            self.sample_buffer
+                .extend(p.sample_buffer.lock().unwrap().drain(..));
+
+            let num_samples = (p.sample_rate.0 as f32 * elapsed.as_secs_f32()).round() as usize;
+            let num_samples = std::cmp::min(num_samples, self.sample_buffer.len());
+            let samples = self.sample_buffer.drain(0..num_samples).collect::<Vec<_>>();
+
+            let mut fft_len = samples.len();
+            // round to the next lowest power of 2
+            if fft_len != 0 {
+                fft_len = samples.len() & (1 << (usize::BITS - 1 - samples.len().leading_zeros()));
+            }
+
+            let fft = rustfft::FftPlanner::new().plan_fft(fft_len, rustfft::FftDirection::Forward);
+            let mut fft_buffer = samples
+                .iter()
+                .take(fft_len)
+                .map(|&s| Complex::new(s, 0.0))
+                .collect::<Vec<Complex<f32>>>();
+            fft.process(&mut fft_buffer);
+
+            for (i, chunk) in fft_buffer.chunks(fft_buffer.len() / EQ_BANDS).enumerate() {
+                let average = chunk.iter().map(|x| x.norm()).sum::<f32>() / chunk.len() as f32;
+                bands[i].position[0] = average;
+            }
+
+            if samples.is_empty() {
+                println!("NO SAMPLES");
+                0.5
+            } else {
+                (samples.iter().copied().map(|x| x.abs() as f64).sum::<f64>()
+                    / samples.len() as f64) as f32
+            }
+        } else {
+            0.5
+        };
+
         let compute_uniforms = shader::compute::ty::Uniforms {
             which_pressure_buffer: self.which_pressure_buffer as u32,
+            amplitude,
+            elapsed: elapsed.as_secs_f32(),
         };
         let compute_uniform_buffer = self.compute_uniforms.next(compute_uniforms)?;
 
         let vertex_uniforms = shader::vertex::ty::Uniforms {
             matrix: self.matrix.into(),
+            num_points: self.points.len() as u32,
         };
         let vertex_uniform_buffer = self.vertex_uniforms.next(vertex_uniforms)?;
+        let bands_uniform_buffer = self.bands_uniform.next(bands)?;
 
         let mut cmd_builder = AutoCommandBufferBuilder::primary(
             self.device.clone(),
@@ -532,20 +660,30 @@ impl Renderer {
             shader::compute::NUM_CELLS_TOTAL as u64..(shader::compute::NUM_CELLS_TOTAL as u64 * 2)
         };
 
-        cmd_builder
-            .fill_buffer(self.pressures.slice(pressure_dst_range).unwrap(), 0)?
-            .bind_pipeline_compute(self.compute_pipeline.clone())
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.compute_pipeline.layout().clone(),
-                0,
-                (
-                    self.compute_storage_descriptors.clone(),
-                    self.compute_uniform_descriptor_pool
-                        .next([WriteDescriptorSet::buffer(0, compute_uniform_buffer)])?,
-                ),
-            )
-            .dispatch([self.points.len() as u32 / 32, 1, 1])?;
+        unsafe {
+            // write_timestamp is marked as unsafe because writing a timestamp without first
+            // resetting the query pool is undefined behavior. We use an `unsafe` block to indicate
+            // to the compiler that we know what we're doing and we've checked for that.
+            cmd_builder
+                .reset_query_pool(self.query_pool.clone(), 0..2)?
+                .write_timestamp(self.query_pool.clone(), 0, PipelineStage::TopOfPipe)?
+                .fill_buffer(self.pressures.slice(pressure_dst_range).unwrap(), 0)?
+                .bind_pipeline_compute(self.compute_pipeline.clone())
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    self.compute_pipeline.layout().clone(),
+                    0,
+                    (
+                        self.compute_storage_descriptors.clone(),
+                        self.compute_uniform_descriptor_pool.next([
+                            WriteDescriptorSet::buffer(0, compute_uniform_buffer),
+                            WriteDescriptorSet::buffer(1, bands_uniform_buffer.clone()),
+                        ])?,
+                    ),
+                )
+                .dispatch([self.points.len() as u32 / 32, 1, 1])?
+                .write_timestamp(self.query_pool.clone(), 1, PipelineStage::BottomOfPipe)?;
+        }
 
         cmd_builder
             .begin_render_pass(
@@ -569,8 +707,10 @@ impl Renderer {
                 PipelineBindPoint::Graphics,
                 self.graphics_pipeline.layout().clone(),
                 0,
-                self.vertex_uniform_descriptor_pool
-                    .next([WriteDescriptorSet::buffer(0, vertex_uniform_buffer)])?,
+                self.vertex_uniform_descriptor_pool.next([
+                    WriteDescriptorSet::buffer(0, vertex_uniform_buffer),
+                    WriteDescriptorSet::buffer(1, bands_uniform_buffer),
+                ])?,
             )
             .bind_vertex_buffers(0, self.points.clone())
             .draw(self.points.len() as u32, 1, 0, 0)?
@@ -578,20 +718,32 @@ impl Renderer {
 
         let commands = cmd_builder.build()?;
 
-        let inflight = self
-            .inflight
-            .take()
-            .unwrap_or_else(|| vulkano::sync::now(self.device.clone()).boxed())
-            .join(acquired)
-            .then_execute(self.queue.clone(), commands)?
+        // Wait for the frame to render.
+        let inflight = commands
+            .execute_after(acquired, self.queue.clone())?
             .then_swapchain_present(self.queue.clone(), swapchain.clone(), fb_idx)
-            .then_signal_fence_and_flush();
-
-        match inflight {
-            Ok(i) => self.inflight = Some(i.boxed()),
+            .then_signal_fence_and_flush()?;
+        match inflight.flush() {
+            Ok(_) => {}
             Err(FlushError::OutOfDate) => suboptimal = true,
             Err(e) => bail!(e),
         }
+
+        // Copy the query results back.
+        let mut timestamps = [0u64; 2];
+        self.query_pool.queries_range(0..2).unwrap().get_results(
+            &mut timestamps,
+            QueryResultFlags {
+                wait: true,
+                partial: false,
+                with_availability: false,
+            },
+        )?;
+
+        let period_ns = self.device.physical_device().properties().timestamp_period;
+        let seconds = period_ns * (timestamps[1] - timestamps[0]) as f32 / 1e9;
+        self.seconds += seconds;
+        self.particles += NUM_PARTICLES_PERAXIS.pow(3) as f32;
 
         self.framebuffers = if suboptimal {
             Framebuffers::Invalid { swapchain }
@@ -604,9 +756,13 @@ impl Renderer {
 
         self.frames += 1;
         if self.last_fps_print.elapsed().as_secs() >= 1 {
-            println!("FPS: {}", self.frames);
+            let particles_per_second = self.particles / self.seconds;
+            let mps = particles_per_second / 1e6;
+            println!("FPS: {}\tMegaParticles/s: {mps}", self.frames);
             self.last_fps_print = Instant::now();
             self.frames = 0;
+            self.seconds = 0.0;
+            self.particles = 0.0;
         }
 
         Ok(())
@@ -628,9 +784,15 @@ fn main() {
         .build_vk_surface(&event_loop, instance.clone())
         .expect("failed to create window");
 
+    let player = audio::play();
+    if let Err(ref e) = player {
+        eprintln!("Failed to initialize audio: {e:#?}");
+    }
+
     let (device, queue) =
         Renderer::create_device(&instance, &surface).expect("failed to create device");
-    let mut renderer = Renderer::new(device, queue, surface).expect("failed to create renderer");
+    let mut renderer =
+        Renderer::new(device, queue, surface, player.ok()).expect("failed to create renderer");
 
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent {
