@@ -208,6 +208,7 @@ pub mod vertex {
             mat4 matrix;
             // The total numer of particles.
             uint num_points;
+            bool magic;
         } uniforms;
         layout(set = 0, binding = 1) buffer Bands {
             vec4 bands[];
@@ -246,12 +247,16 @@ pub mod vertex {
             // brightness corresponds to the amplitude.
             float hue = float(gl_VertexIndex) / uniforms.num_points;
             color = vec4(hsv2rgb(vec3(hue, 1, 1)), 1) * intensity;
+
+            gl_PointSize = 1 + (5 * 3) * int(uniforms.magic);
+            color.a += float(uniforms.magic) * 42;
         }
         "
     }
 }
 
 /// The simplest fragment shader imaginable.
+/// Usually.
 pub mod fragment {
     vulkano_shaders::shader! {
         ty: "fragment",
@@ -259,9 +264,28 @@ pub mod fragment {
         #version 450
         layout(location = 0) in vec4 in_color;
         layout(location = 0) out vec4 out_color;
-        
+
+        vec2 i_point_c = ivec2(gl_PointCoord * 5.);
+
         void main() {
-            out_color = in_color;
+            vec3 color = vec3(in_color);
+
+            if (in_color.a > 42) {
+                bool magic = 
+                    i_point_c == ivec2(0, 0)
+                    || i_point_c == ivec2(0, 4)
+                    || i_point_c == ivec2(0, 3)
+                    || i_point_c == ivec2(2, 4)
+                    || i_point_c.x == 4;
+
+                bool magic2 = i_point_c == ivec2(3, 1)
+                    || i_point_c == ivec2(2, 1);
+
+                if (magic) discard;
+                color += vec3(magic2) * sqrt(sqrt(in_color.a - 42));
+            }
+        
+            out_color = vec4(color, 1.0);
         }
         "
     }

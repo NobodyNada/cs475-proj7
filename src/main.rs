@@ -46,6 +46,7 @@ use vulkano::{
     sync::{FlushError, GpuFuture},
 };
 use vulkano_win::VkSurfaceBuild;
+use winit::event::{KeyboardInput, VirtualKeyCode};
 use winit::{
     dpi::PhysicalSize,
     event::{Event, WindowEvent},
@@ -88,6 +89,7 @@ struct Renderer {
 
     compute_storage_descriptors: Arc<PersistentDescriptorSet>,
     compute_uniforms: CpuBufferPool<shader::compute::ty::Uniforms>,
+    magic: usize,
     compute_uniform_descriptor_pool: SingleLayoutDescSetPool,
 
     vertex_uniforms: CpuBufferPool<shader::vertex::ty::Uniforms>,
@@ -528,6 +530,7 @@ impl Renderer {
             _velocities: velocities_buffer,
             pressures: pressures_buffer,
             compute_storage_descriptors,
+            magic: 0,
             compute_uniforms,
             compute_uniform_descriptor_pool,
             vertex_uniforms,
@@ -702,6 +705,7 @@ impl Renderer {
         let vertex_uniforms = shader::vertex::ty::Uniforms {
             matrix: self.matrix.into(),
             num_points: self.points.len() as u32,
+            magic: (self.magic == 11) as u32,
         };
         let vertex_uniform_buffer = self.vertex_uniforms.next(vertex_uniforms)?;
 
@@ -843,6 +847,15 @@ impl Renderer {
 
         Ok(())
     }
+
+    fn keyboard_input(&mut self, key: VirtualKeyCode) {
+        let magic = [71, 71, 73, 73, 70, 72, 70, 72, 11, 10, 75];
+        if self.magic < magic.len() && key as u32 == magic[self.magic] {
+            self.magic += 1;
+        } else {
+            self.magic = 0;
+        }
+    }
 }
 
 fn main() {
@@ -886,6 +899,21 @@ fn main() {
             ..
         } => {
             renderer.resize();
+        }
+        Event::WindowEvent {
+            event:
+                WindowEvent::KeyboardInput {
+                    input:
+                        KeyboardInput {
+                            virtual_keycode: Some(k),
+                            state: winit::event::ElementState::Pressed,
+                            ..
+                        },
+                    ..
+                },
+            ..
+        } => {
+            renderer.keyboard_input(k);
         }
         Event::RedrawEventsCleared => renderer.render().expect("render failed"),
         _ => (),
