@@ -59,40 +59,65 @@ mod shader;
 const NUM_PARTICLES_PERAXIS: usize = 100;
 const VIEW_DISTANCE: f32 = 10.0;
 
+/// Our renderer, in charge of managing Vulkan resources and drawing stuff.
 struct Renderer {
+    /// The Vulkan device.
     device: Arc<Device>,
     queue: Arc<Queue>,
     surface: Arc<Surface<Window>>,
     color_format: Format,
     depth_format: Format,
+
     render_pass: Arc<RenderPass>,
     framebuffers: Framebuffers,
     compute_pipeline: Arc<ComputePipeline>,
     graphics_pipeline: Arc<GraphicsPipeline>,
+
+    /// The particle positions, stored on device memory..
     points: Arc<DeviceLocalBuffer<[shader::Point]>>,
+    /// The particle velocities, stored on device memory.
     _velocities: Arc<DeviceLocalBuffer<[shader::Velocity]>>,
+    /// The pressure of each cell, stored on device memory.
+    /// This buffer is twice the size you'd expect: it stores
+    /// one copy of the pressures from the previous frame, and
+    /// a second copy to accumulate pressures being computed this frame.
     pressures: Arc<DeviceLocalBuffer<[u32]>>,
+
+    /// Which part of the pressure buffers is currently being written to.
+    which_pressure_buffer: bool,
 
     compute_storage_descriptors: Arc<PersistentDescriptorSet>,
     compute_uniforms: CpuBufferPool<shader::compute::ty::Uniforms>,
     compute_uniform_descriptor_pool: SingleLayoutDescSetPool,
 
     vertex_uniforms: CpuBufferPool<shader::vertex::ty::Uniforms>,
-    bands_uniform: CpuBufferPool<[shader::Point; 64]>,
+    /// The buffer storing the amplitudes of each frequency band.
+    /// Note that each band is stored as a vec4, with only the first component used, because
+    /// apparently SPIR-V does not allow arrays of floats (?)
+    bands_uniform: CpuBufferPool<[shader::Point; shader::compute::EQ_BANDS as usize]>,
     vertex_uniform_descriptor_pool: SingleLayoutDescSetPool,
 
+    /// The projection & view matrix.
     matrix: cgmath::Matrix4<f32>,
+
+    /// The time we started the last frame.
     last_frame: Instant,
+    /// The time we last printed performance.
     last_fps_print: Instant,
-    frames: u32,
-    which_pressure_buffer: bool,
-
-    player: Option<audio::Player>,
-    sample_buffer: VecDeque<f32>,
-
+    /// The query pool we use to measure timestamps of GPU operations.
     query_pool: Arc<QueryPool>,
+    /// The number of frames since we last printed performance.
+    frames: u32,
+    /// The number of particles computed since we last printed performance.
     particles: f32,
+    /// The amount of time we've spent computing particles since we last printed performance.
     seconds: f32,
+
+    /// The audio player.
+    player: Option<audio::Player>,
+
+    /// Incoming audio samples we have yet to analyze.
+    sample_buffer: VecDeque<f32>,
 }
 
 enum Framebuffers {
@@ -128,6 +153,7 @@ impl Framebuffers {
 }
 
 impl Renderer {
+    /// Selects and initializes a Vulkan device.
     fn create_device(
         instance: &Arc<Instance>,
         surface: &Surface<Window>,
@@ -176,12 +202,14 @@ impl Renderer {
         Ok((device, queues.next().unwrap()))
     }
 
+    /// Creates the renderer.
     fn new(
         device: Arc<Device>,
         queue: Arc<Queue>,
         surface: Arc<Surface<Window>>,
         player: Option<audio::Player>,
     ) -> Result<Self> {
+        // Choose a color and depth format.
         let color_format = device
             .physical_device()
             .surface_formats(&surface, Default::default())?
@@ -194,7 +222,7 @@ impl Renderer {
             .0;
         let depth_format = Format::D16_UNORM;
 
-        // Render some test points
+        // Uniformly distribute particles inside of the unit cube.
         let points: Vec<shader::Point> = (0..NUM_PARTICLES_PERAXIS)
             .flat_map(|x| (0..NUM_PARTICLES_PERAXIS).map(move |y| (x, y)))
             .flat_map(|(x, y)| {
@@ -210,6 +238,7 @@ impl Renderer {
             })
             .collect();
 
+        // Allocate device memory for our buffers.
         let points_buffer = DeviceLocalBuffer::array(
             device.clone(),
             points.len() as u64,
@@ -265,14 +294,17 @@ impl Renderer {
             .execute(queue.clone())?
             .then_signal_fence_and_flush()?;
 
+        // Create our render pass:
         let render_pass = single_pass_renderpass!(device.clone(),
             attachments: {
+                // Clear the color buffer on load, and store it to memory so we can see it.
                 color: {
                     load: Clear,
                     store: Store,
                     format: color_format,
                     samples: 1,
                 },
+                // Clear the depth buffer on load, but we don't need to save the results.
                 depth: {
                     load: Clear,
                     store: DontCare,
@@ -286,10 +318,12 @@ impl Renderer {
             }
         )?;
 
+        // Load our shaders.
         let cs = shader::compute::load(device.clone())?;
         let vs = shader::vertex::load(device.clone())?;
         let fs = shader::fragment::load(device.clone())?;
 
+        // Define our shader binding layouts.
         let compute_storage_layout = DescriptorSetLayout::new(
             device.clone(),
             DescriptorSetLayoutCreateInfo {
@@ -368,6 +402,8 @@ impl Renderer {
             },
         )?;
 
+        // Create the compute pipeline, which defines the shader program along with its inputs and
+        // outputs.
         let compute_pipeline = ComputePipeline::with_pipeline_layout(
             device.clone(),
             cs.entry_point("main").unwrap(),
@@ -385,6 +421,7 @@ impl Renderer {
             None,
         )?;
 
+        // Define our persistent bindings -- the buffers that will stay bound and never change.
         let compute_storage_descriptors = PersistentDescriptorSet::new(
             compute_storage_layout,
             [
@@ -394,12 +431,17 @@ impl Renderer {
             ],
         )?;
 
+        // Create a buffer pool for our uniforms (these buffers will change every frame as we
+        // upload new values).
         let compute_uniforms = CpuBufferPool::new(
             device.clone(),
             BufferUsage::uniform_buffer_transfer_destination(),
         );
+        // Create a descriptor pool that we can use to instantiate descriptors to bind uniform
+        // buffers to our compute shader.
         let compute_uniform_descriptor_pool = SingleLayoutDescSetPool::new(compute_uniform_layout);
 
+        // Now do all that again, but for the graphics pipelie with our vertex and fragment shader.
         let graphics_pipeline = GraphicsPipeline::start()
             .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
             .vertex_input_state(BuffersDefinition::new().vertex::<shader::Point>())
@@ -469,6 +511,7 @@ impl Renderer {
             },
         )?;
 
+        // Wait for the buffer uploads we submitted earlier to complete.
         inflight.wait(None)?;
 
         Ok(Self {
@@ -503,6 +546,7 @@ impl Renderer {
         })
     }
 
+    /// Creates a projection/view matrix.
     fn create_matrix(dimensions: PhysicalSize<u32>) -> Matrix4<f32> {
         let aspect = dimensions.width as f32 / dimensions.height as f32;
         let proj = cgmath::perspective(cgmath::Deg(90.0), aspect, 1.0, 100.0);
@@ -514,10 +558,12 @@ impl Renderer {
         proj * view
     }
 
+    /// Indicates that the window has been resized and the framebuffers should be recreated.
     fn resize(&mut self) {
         self.framebuffers.invalidate()
     }
 
+    /// Called every frame to update the simulation and render the scene.
     fn render(&mut self) -> Result<()> {
         let dimensions = self.surface.window().inner_size();
 
@@ -590,15 +636,18 @@ impl Renderer {
             Err(e) => bail!(e),
         };
 
-        // Figure out our uniforms.
+        // Deal with audio samples.
         const EQ_BANDS: usize = shader::compute::EQ_BANDS as usize;
         let mut bands = [shader::Point {
             position: [1.0, 0.0, 0.0, 0.0],
         }; EQ_BANDS];
-        let amplitude = if let Some(ref p) = self.player {
+        let mut amplitude = 0.5;
+        if let Some(ref p) = self.player {
+            // Take whatever samples the player has generated in the meantime.
             self.sample_buffer
                 .extend(p.sample_buffer.lock().unwrap().drain(..));
 
+            // Take one frames' worth of audio out of the buffer.
             let num_samples = (p.sample_rate.0 as f32 * elapsed.as_secs_f32()).round() as usize;
             let num_samples = std::cmp::min(num_samples, self.sample_buffer.len());
             let samples = self.sample_buffer.drain(0..num_samples).collect::<Vec<_>>();
@@ -609,6 +658,7 @@ impl Renderer {
                 fft_len = samples.len() & (1 << (usize::BITS - 1 - samples.len().leading_zeros()));
             }
 
+            // Do a fast Fourier transform to convert our sound samples into the frequency domain.
             let fft = rustfft::FftPlanner::new().plan_fft(fft_len, rustfft::FftDirection::Forward);
             let mut fft_buffer = samples
                 .iter()
@@ -617,22 +667,23 @@ impl Renderer {
                 .collect::<Vec<Complex<f32>>>();
             fft.process(&mut fft_buffer);
 
+            // Divide the FFT results into bands.
             for (i, chunk) in fft_buffer.chunks(fft_buffer.len() / EQ_BANDS).enumerate() {
                 let average = chunk.iter().map(|x| x.norm()).sum::<f32>() / chunk.len() as f32;
                 bands[i].position[0] = average;
             }
 
             if samples.is_empty() {
+                // The audio engine has fallen behind.
                 println!("NO SAMPLES");
-                0.5
             } else {
-                (samples.iter().copied().map(|x| x.abs() as f64).sum::<f64>()
-                    / samples.len() as f64) as f32
+                // Set our amplitude to the average amplitude of the samples.
+                amplitude = (samples.iter().copied().map(|x| x.abs() as f64).sum::<f64>()
+                    / samples.len() as f64) as f32;
             }
-        } else {
-            0.5
-        };
+        }
 
+        // Upload our compute shader uniforms.
         let compute_uniforms = shader::compute::ty::Uniforms {
             which_pressure_buffer: self.which_pressure_buffer as u32,
             amplitude,
@@ -640,13 +691,17 @@ impl Renderer {
         };
         let compute_uniform_buffer = self.compute_uniforms.next(compute_uniforms)?;
 
+        // Upload our vertex shader uniforms.
         let vertex_uniforms = shader::vertex::ty::Uniforms {
             matrix: self.matrix.into(),
             num_points: self.points.len() as u32,
         };
         let vertex_uniform_buffer = self.vertex_uniforms.next(vertex_uniforms)?;
+
+        // Upload the frequency bands.
         let bands_uniform_buffer = self.bands_uniform.next(bands)?;
 
+        // We're ready to issue some rendering commands!
         let mut cmd_builder = AutoCommandBufferBuilder::primary(
             self.device.clone(),
             self.queue.family(),
@@ -654,20 +709,25 @@ impl Renderer {
         )
         .expect("Could not create command buffer builder");
 
+        // Are we going to write to the first half or the second half of the pressure buffer?
         let pressure_dst_range = if self.which_pressure_buffer {
             0..shader::compute::NUM_CELLS_TOTAL as u64
         } else {
             shader::compute::NUM_CELLS_TOTAL as u64..(shader::compute::NUM_CELLS_TOTAL as u64 * 2)
         };
 
+        // First, execute the compute program.
         unsafe {
             // write_timestamp is marked as unsafe because writing a timestamp without first
             // resetting the query pool is undefined behavior. We use an `unsafe` block to indicate
             // to the compiler that we know what we're doing and we've checked for that.
             cmd_builder
+                // Measure the time at which the GPU begins running the compute pipeline.
                 .reset_query_pool(self.query_pool.clone(), 0..2)?
                 .write_timestamp(self.query_pool.clone(), 0, PipelineStage::TopOfPipe)?
+                // Zero out the destination area of the pressure buffer.
                 .fill_buffer(self.pressures.slice(pressure_dst_range).unwrap(), 0)?
+                // Bind our uniform buffers to our compute program.
                 .bind_pipeline_compute(self.compute_pipeline.clone())
                 .bind_descriptor_sets(
                     PipelineBindPoint::Compute,
@@ -681,11 +741,15 @@ impl Renderer {
                         ])?,
                     ),
                 )
+                // Run our compute program over all the particles.
                 .dispatch([self.points.len() as u32 / 32, 1, 1])?
+                // Measure the time at which we finish running the compute pipeline.
                 .write_timestamp(self.query_pool.clone(), 1, PipelineStage::BottomOfPipe)?;
         }
 
+        // We have now updated the particle simulation, so render the results.
         cmd_builder
+            // Begin a render pass, clearing the color and depth buffer.
             .begin_render_pass(
                 framebuffers[fb_idx].clone(),
                 SubpassContents::Inline,
@@ -703,6 +767,7 @@ impl Renderer {
                 }],
             )
             .bind_pipeline_graphics(self.graphics_pipeline.clone())
+            // Attach our vertex and uniform buffers to our shaders.
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 self.graphics_pipeline.layout().clone(),
@@ -713,14 +778,16 @@ impl Renderer {
                 ])?,
             )
             .bind_vertex_buffers(0, self.points.clone())
+            // Run our graphics program over all our particles.
             .draw(self.points.len() as u32, 1, 0, 0)?
             .end_render_pass()?;
 
-        let commands = cmd_builder.build()?;
-
-        // Wait for the frame to render.
-        let inflight = commands
+        // Actually generate the command buffer and upload it to the GPU.
+        let inflight = cmd_builder
+            .build()?
+            // Don't run until the framebuffer is ready.
             .execute_after(acquired, self.queue.clone())?
+            // Once we're done rendering, present the buffer to the screen.
             .then_swapchain_present(self.queue.clone(), swapchain.clone(), fb_idx)
             .then_signal_fence_and_flush()?;
         match inflight.flush() {
@@ -728,6 +795,15 @@ impl Renderer {
             Err(FlushError::OutOfDate) => suboptimal = true,
             Err(e) => bail!(e),
         }
+
+        self.framebuffers = if suboptimal {
+            Framebuffers::Invalid { swapchain }
+        } else {
+            Framebuffers::Valid {
+                swapchain,
+                framebuffers,
+            }
+        };
 
         // Copy the query results back.
         let mut timestamps = [0u64; 2];
@@ -740,22 +816,15 @@ impl Renderer {
             },
         )?;
 
+        // Update our statistics.
         let period_ns = self.device.physical_device().properties().timestamp_period;
         let seconds = period_ns * (timestamps[1] - timestamps[0]) as f32 / 1e9;
         self.seconds += seconds;
         self.particles += NUM_PARTICLES_PERAXIS.pow(3) as f32;
-
-        self.framebuffers = if suboptimal {
-            Framebuffers::Invalid { swapchain }
-        } else {
-            Framebuffers::Valid {
-                swapchain,
-                framebuffers,
-            }
-        };
-
         self.frames += 1;
+
         if self.last_fps_print.elapsed().as_secs() >= 1 {
+            // It's been a second since the last time we printed our statistics, so do that.
             let particles_per_second = self.particles / self.seconds;
             let mps = particles_per_second / 1e6;
             println!("FPS: {}\tMegaParticles/s: {mps}", self.frames);
@@ -781,19 +850,23 @@ fn main() {
 
     // Create a window with a Vulkan surface
     let surface = winit::window::WindowBuilder::new()
+        .with_title("CS 475 Project 7A")
         .build_vk_surface(&event_loop, instance.clone())
         .expect("failed to create window");
 
+    // Start audio.
     let player = audio::play();
     if let Err(ref e) = player {
         eprintln!("Failed to initialize audio: {e:#?}");
     }
 
+    // Create our renderer.
     let (device, queue) =
         Renderer::create_device(&instance, &surface).expect("failed to create device");
     let mut renderer =
         Renderer::new(device, queue, surface, player.ok()).expect("failed to create renderer");
 
+    // Run the window's event loop.
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent {
             event: WindowEvent::CloseRequested,
