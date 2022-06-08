@@ -246,6 +246,8 @@ pub mod vertex {
             // brightness corresponds to the amplitude.
             float hue = float(gl_VertexIndex) / uniforms.num_points;
             color = vec4(hsv2rgb(vec3(hue, 1, 1)), 1) * intensity;
+
+            gl_PointSize = 5 * 3;
         }
         "
     }
@@ -259,9 +261,27 @@ pub mod fragment {
         #version 450
         layout(location = 0) in vec4 in_color;
         layout(location = 0) out vec4 out_color;
-        
+
+        vec2 i_point_c = ivec2(gl_PointCoord * 5.);
+
         void main() {
-            out_color = in_color;
+            bool amogus = 
+                i_point_c == ivec2(0, 0)
+                || i_point_c == ivec2(0, 4)
+                || i_point_c == ivec2(0, 3)
+                || i_point_c == ivec2(2, 4)
+                || i_point_c.x == 4;
+
+            bool visor = i_point_c == ivec2(3, 1)
+                || i_point_c == ivec2(2, 1);
+
+            if (amogus) discard;
+
+            vec3 color = vec3(in_color);
+
+            color += vec3(visor);
+        
+            out_color = vec4(color, 1.0);
         }
         "
     }
