@@ -660,36 +660,38 @@ impl Renderer {
             // Take one frames' worth of audio out of the buffer.
             let num_samples = (p.sample_rate.0 as f32 * elapsed.as_secs_f32()).round() as usize;
             let num_samples = std::cmp::min(num_samples, self.sample_buffer.len());
-            let samples = self.sample_buffer.drain(0..num_samples).collect::<Vec<_>>();
 
-            let mut fft_len = samples.len();
-            // round to the next lowest power of 2
-            if fft_len != 0 {
-                fft_len = samples.len() & (1 << (usize::BITS - 1 - samples.len().leading_zeros()));
-            }
+            if num_samples >= EQ_BANDS {
+                let samples = self.sample_buffer.drain(0..num_samples).collect::<Vec<_>>();
 
-            // Do a fast Fourier transform to convert our sound samples into the frequency domain.
-            let fft = rustfft::FftPlanner::new().plan_fft(fft_len, rustfft::FftDirection::Forward);
-            let mut fft_buffer = samples
-                .iter()
-                .take(fft_len)
-                .map(|&s| Complex::new(s, 0.0))
-                .collect::<Vec<Complex<f32>>>();
-            fft.process(&mut fft_buffer);
+                let mut fft_len = samples.len();
+                // round to the next lowest power of 2
+                if fft_len != 0 {
+                    fft_len =
+                        samples.len() & (1 << (usize::BITS - 1 - samples.len().leading_zeros()));
+                }
 
-            // Divide the FFT results into bands.
-            for (i, chunk) in fft_buffer.chunks(fft_buffer.len() / EQ_BANDS).enumerate() {
-                let average = chunk.iter().map(|x| x.norm()).sum::<f32>() / chunk.len() as f32;
-                bands[i].position[0] = average;
-            }
+                // Do a fast Fourier transform to convert our sound samples into the frequency domain.
+                let fft =
+                    rustfft::FftPlanner::new().plan_fft(fft_len, rustfft::FftDirection::Forward);
+                let mut fft_buffer = samples
+                    .iter()
+                    .take(fft_len)
+                    .map(|&s| Complex::new(s, 0.0))
+                    .collect::<Vec<Complex<f32>>>();
+                fft.process(&mut fft_buffer);
 
-            if samples.is_empty() {
-                // The audio engine has fallen behind.
-                println!("NO SAMPLES");
-            } else {
+                // Divide the FFT results into bands.
+                for (i, chunk) in fft_buffer.chunks(fft_buffer.len() / EQ_BANDS).enumerate() {
+                    let average = chunk.iter().map(|x| x.norm()).sum::<f32>() / chunk.len() as f32;
+                    bands[i].position[0] = average;
+                }
                 // Set our amplitude to the average amplitude of the samples.
                 amplitude = (samples.iter().copied().map(|x| x.abs() as f64).sum::<f64>()
                     / samples.len() as f64) as f32;
+            } else {
+                // The audio engine has fallen behind.
+                println!("NO SAMPLES");
             }
         }
 
